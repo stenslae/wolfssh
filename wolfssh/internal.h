@@ -2163,9 +2163,17 @@ enum WS_MessageIdLimits {
 #ifndef WOLFSSH_NO_ECDSA
     WOLFSSH_API int wolfSSH_TestParseECCPubKey(WOLFSSH* ssh, byte* pubKey,
             word32 pubKeySz);
+    WOLFSSH_API int wolfSSH_TestBuildUserAuthRequestEcc(WOLFSSH* ssh,
+            byte* output, word32 outputSz, word32* idx,
+            const WS_UserAuthData* authData, const byte* sigStart,
+            word32 sigStartIdx, WS_KeySignature* keySig);
 #ifdef WOLFSSH_CERTS
     WOLFSSH_API int wolfSSH_TestParseECCPubKeyCert(WOLFSSH* ssh, byte* pubKey,
             word32 pubKeySz);
+    WOLFSSH_API int wolfSSH_TestBuildUserAuthRequestEccCert(WOLFSSH* ssh,
+            byte* output, word32 outputSz, word32* idx,
+            const WS_UserAuthData* authData, const byte* sigStart,
+            word32 sigStartIdx, WS_KeySignature* keySig);
 #endif /* WOLFSSH_CERTS */
 #endif /* !WOLFSSH_NO_ECDSA */
 #ifndef WOLFSSH_NO_ED25519

@@ -2408,6 +2408,16 @@ static void PutU32BE(byte* out, word32 v)
     out[2] = (byte)(v >> 8);
     out[3] = (byte)(v);
 }
+
+/* Read a big-endian uint32; guard matches its callers in the ECC bounds
+ * test, so it is not compiled unused. */
+#ifndef WOLFSSH_NO_ECDSA
+static word32 GetU32BE(const byte* in)
+{
+    return ((word32)in[0] << 24) | ((word32)in[1] << 16) |
+           ((word32)in[2] << 8) | (word32)in[3];
+}
+#endif
 #endif /* WOLFSSH_TEST_INTERNAL */
 
 
@@ -16399,6 +16409,1010 @@ done:
 }
 #endif
 
+#ifndef WOLFSSH_NO_ECDSA
+
+/* Result codes: RunEccBoundsCase()/RunEccBoundsAgentCase() return 0 on match,
+ * else -1 wrong return, -2 wrote before startIdx, -3 retry (signature size
+ * varied), -4 idx moved on failure, -5 wrote past the allowed extent,
+ * -6 outputSz exceeds the test buffer, -7 block size out of range,
+ * -8 malformed sig block header, -9 wrong error code, -10 wrote past idx,
+ * -11 agent signature not copied, -12 WS_BUFFER_E on an expected success,
+ * -13 malformed r/s mpints, -14 signature did not verify,
+ * -15 the test's checkData buffer is too small for startIdx.
+ * RunEccBoundsCurve()/RunEccBoundsAgent() add the case offset (-100 startIdx
+ * past outputSz, -200 no room, -300 undersized, -400 exact-min,
+ * -500 exact-max) and
+ * test_BuildUserAuthRequestEccBounds() adds the curve offset (-1000 p256,
+ * -2000 p256 cert, -3000 p384, -4000 p384 cert, -5000 p521, -6000 p521 cert,
+ * -7000 agent, -8000 guards, -9000 cert guards).
+ * RunEccBoundsCurve() itself returns -1 wc_ecc_init, -2 wc_ecc_make_key and
+ * RunEccBoundsAgent() itself returns -1 CTX_new, -2 agent ctx setup,
+ * -3 wolfSSH_new, -4 agent ssh setup, all without a case offset.
+ * RunEccBoundsGuards() returns 0, 1 if the invalid-algorithm sub-case was
+ * skipped because no unnamed sigId maps to a hash this build has, else
+ * -4/-5 from EccBoundsCheckRejected(), -20..-25 wrong return for a NULL
+ * ssh/output/idx/authData/sigStart/keySig, -30..-35 wrote on that same NULL
+ * argument, -26 wc_ecc_init, -27 wc_ecc_make_key, -28 an unnamed sigId was
+ * signed, -29 wrote before startIdx, -36 an unnamed sigId was rejected
+ * with the wrong wolfSSH error. A skip propagates out of
+ * test_BuildUserAuthRequestEccBounds() as 1. */
+#define ECC_BOUNDS_STARTIDX 100
+/* Where sigStart points into output, so the cases exercise a non-zero
+ * sigStartIdx and bind the signature to sigStart rather than to output. */
+#define ECC_BOUNDS_SIGSTARTIDX 40
+/* Position-dependent fill for the parts of output the builder must not touch.
+ * It varies with the index so a case that signs the wrong window of output
+ * cannot verify against the right one. */
+#define ECC_BOUNDS_FILL(i) ((byte)(((i) * 7) + 0x5A))
+/* Retry budget for size-sensitive cases due to variable mpint lengths. */
+#define ECC_BOUNDS_SIG_RETRIES 64
+
+/* Lay down the fill pattern EccBoundsScan() checks against. */
+static void EccBoundsFill(byte* output, word32 outputSz)
+{
+    word32 i;
+
+    for (i = 0; i < outputSz; i++) {
+        output[i] = ECC_BOUNDS_FILL(i);
+    }
+}
+
+/* Scan output[from, to) for bytes the builder must not have touched.
+ * Returns 0 when clean, -1 otherwise. */
+static int EccBoundsScan(const char* who, const byte* output, word32 from,
+        word32 to, const char* what, word32 bound, word32 outputSz, int ret)
+{
+    word32 i;
+
+    for (i = from; i < to; i++) {
+        if (output[i] != ECC_BOUNDS_FILL(i)) {
+            printf("%s: outputSz=%u wrote %s%u at byte %u (ret=%d)\n",
+                    who, (unsigned)outputSz, what, (unsigned)bound,
+                    (unsigned)i, ret);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Invariants every rejected build must hold: nothing written at or past
+ * startIdx, and idx left where the caller set it. checkRet also requires the
+ * rejection to be WS_BUFFER_E. Returns 0, -4, -5 or -9. */
+static int EccBoundsCheckRejected(const char* who, const byte* output,
+        word32 startIdx, word32 to, word32 idx, word32 outputSz, int ret,
+        int checkRet)
+{
+    /* Before the write scan, so an unexpected success is reported as one
+     * rather than as the stray write it necessarily leaves behind. */
+    if (checkRet && ret != WS_BUFFER_E) {
+        printf("%s: outputSz=%u expected WS_BUFFER_E, got %d\n",
+                who, (unsigned)outputSz, ret);
+        return -9;
+    }
+    if (EccBoundsScan(who, output, startIdx, to,
+            "into the output buffer at or past startIdx=", startIdx,
+            outputSz, ret) != 0) {
+        return -5;
+    }
+    if (idx != startIdx) {
+        printf("%s: outputSz=%u idx modified on failure: %u\n",
+                who, (unsigned)outputSz, (unsigned)idx);
+        return -4;
+    }
+
+    return 0;
+}
+
+/* Dispatch to the plain or certificate ECDSA builder. Both test hooks take
+ * the same arguments. */
+static int EccBoundsBuild(int useCert, WOLFSSH* ssh, byte* output,
+        word32 outputSz, word32* idx, const WS_UserAuthData* authData,
+        const byte* sigStart, word32 sigStartIdx, WS_KeySignature* keySig)
+{
+#ifdef WOLFSSH_CERTS
+    if (useCert) {
+        return wolfSSH_TestBuildUserAuthRequestEccCert(ssh, output, outputSz,
+                idx, authData, sigStart, sigStartIdx, keySig);
+    }
+#else
+    (void)useCert;
+#endif
+    return wolfSSH_TestBuildUserAuthRequestEcc(ssh, output, outputSz, idx,
+            authData, sigStart, sigStartIdx, keySig);
+}
+
+/* Check the r/s mpints EncodeEcdsaRsToMpints() wrote into the sig block:
+ * exact framing of both mpints, then the signature itself against the key
+ * that signed it. Returns 0 on match, -13 on bad framing, -14 on a bad
+ * signature, -15 when the test's own buffer cannot hold the prefix. */
+static int EccBoundsCheckSig(const char* who, WOLFSSH* ssh,
+        WS_KeySignature* keySig, const byte* output, word32 startIdx,
+        word32 written, word32 namesSz, word32 outputSz)
+{
+    const byte* mpints = output + startIdx + (LENGTH_SZ * 3) + namesSz;
+    word32 mpintsSz = written - (LENGTH_SZ * 3) - namesSz;
+    const byte* r;
+    const byte* s;
+    word32 rSz, sSz;
+
+    if (mpintsSz < (LENGTH_SZ * 2) + 2) {
+        printf("%s: outputSz=%u mpint block too short: %u\n",
+                who, (unsigned)outputSz, (unsigned)mpintsSz);
+        return -13;
+    }
+
+    rSz = GetU32BE(mpints);
+    if (rSz == 0 || rSz > mpintsSz - (LENGTH_SZ * 2)) {
+        printf("%s: outputSz=%u bad r mpint length: %u\n",
+                who, (unsigned)outputSz, (unsigned)rSz);
+        return -13;
+    }
+    r = mpints + LENGTH_SZ;
+
+    sSz = GetU32BE(r + rSz);
+    /* Both mpints must consume the block exactly. */
+    if (sSz == 0 || sSz != mpintsSz - (LENGTH_SZ * 2) - rSz) {
+        printf("%s: outputSz=%u bad s mpint length: %u\n",
+                who, (unsigned)outputSz, (unsigned)sSz);
+        return -13;
+    }
+    s = r + rSz + LENGTH_SZ;
+
+    /* Each mpint is non-negative, and padded only when it has to be. */
+    if ((r[0] & 0x80) || (s[0] & 0x80) ||
+            (r[0] == 0 && (rSz == 1 || !(r[1] & 0x80))) ||
+            (s[0] == 0 && (sSz == 1 || !(s[1] & 0x80)))) {
+        printf("%s: outputSz=%u mpint padding malformed\n",
+                who, (unsigned)outputSz);
+        return -13;
+    }
+
+/* No key is imported here, but wc_ecc_rs_raw_to_sig()'s prototype lives
+ * under HAVE_ECC_KEY_IMPORT in ecc.h, so the block needs both. */
+#if defined(HAVE_ECC_VERIFY) && defined(HAVE_ECC_KEY_IMPORT)
+    {
+        /* Rebuild the digest the builder signed: the session ID, then
+         * everything sigStart covered, which here is
+         * output[ECC_BOUNDS_SIGSTARTIDX, startIdx). */
+        byte   checkData[LENGTH_SZ + WC_MAX_DIGEST_SIZE + ECC_BOUNDS_STARTIDX];
+        byte   digest[WC_MAX_DIGEST_SIZE];
+        byte   der[ECC_MAX_SIG_SIZE];
+        word32 checkDataSz = 0;
+        word32 digestSz;
+        word32 derSz = (word32)sizeof(der);
+        enum wc_HashType hashId;
+        int    verified = 0;
+        int    ret;
+
+        /* checkData is sized from ECC_BOUNDS_STARTIDX, but the prefix length
+         * comes from the caller, so hold the two together here. */
+        if (LENGTH_SZ + ssh->sessionIdSz +
+                (startIdx - ECC_BOUNDS_SIGSTARTIDX) >
+                        (word32)sizeof(checkData)) {
+            printf("%s: checkData too small for startIdx=%u\n", who,
+                    (unsigned)startIdx);
+            return -15;
+        }
+
+        switch (wc_ecc_size(&keySig->ks.ecc.key)) {
+            case 32: hashId = WC_HASH_TYPE_SHA256; break;
+            case 48: hashId = WC_HASH_TYPE_SHA384; break;
+            default: hashId = WC_HASH_TYPE_SHA512; break;
+        }
+        digestSz = wc_HashGetDigestSize(hashId);
+
+        PutU32BE(checkData, ssh->sessionIdSz);
+        checkDataSz += LENGTH_SZ;
+        WMEMCPY(checkData + checkDataSz, ssh->sessionId, ssh->sessionIdSz);
+        checkDataSz += ssh->sessionIdSz;
+        WMEMCPY(checkData + checkDataSz, output + ECC_BOUNDS_SIGSTARTIDX,
+                startIdx - ECC_BOUNDS_SIGSTARTIDX);
+        checkDataSz += startIdx - ECC_BOUNDS_SIGSTARTIDX;
+
+        ret = wc_Hash(hashId, checkData, checkDataSz, digest, digestSz);
+        if (ret == 0) {
+            ret = wc_ecc_rs_raw_to_sig(r, rSz, s, sSz, der, &derSz);
+        }
+        if (ret == 0) {
+            ret = wc_ecc_verify_hash(der, derSz, digest, digestSz, &verified,
+                    &keySig->ks.ecc.key);
+        }
+        if (ret != 0 || !verified) {
+            printf("%s: outputSz=%u signature did not verify: ret=%d"
+                    " verified=%d\n", who, (unsigned)outputSz, ret, verified);
+            return -14;
+        }
+    }
+#else
+    (void)ssh;
+    (void)keySig;
+#endif /* HAVE_ECC_VERIFY && HAVE_ECC_KEY_IMPORT */
+
+    return 0;
+}
+
+/* Checks what the builder wrote into output[startIdx, startIdx + written).
+ * Returns 0 on match, -3 to ask the caller to retry, or a case-specific
+ * code. */
+typedef int (*EccBoundsVerifyCb)(const char* who, const byte* output,
+        word32 startIdx, word32 written, word32 outputSz, void* ctx);
+
+/* Scaffolding shared by every bounds case: fill, build, scan either side of
+ * the written block, and the invariants a rejected build must hold.
+ * sizeSensitive marks a case whose outcome rides on variable mpint lengths,
+ * so an unexpected WS_BUFFER_E or WS_SUCCESS asks the caller to retry (-12,
+ * -3) instead of failing. Returns 0 on match. */
+static int RunEccBoundsShared(const char* who, WOLFSSH* ssh, int useCert,
+        const WS_UserAuthData* authData, WS_KeySignature* keySig,
+        byte* output, word32 outputBufSz, word32 startIdx, word32 outputSz,
+        int expectSuccess, int sizeSensitive, EccBoundsVerifyCb verify,
+        void* verifyCtx)
+{
+    word32 idx = startIdx;
+    word32 written;
+    int    ret;
+    int    result;
+
+    if (outputSz > outputBufSz) {
+        printf("%s: outputSz=%u exceeds test buffer\n", who,
+                (unsigned)outputSz);
+        return -6;
+    }
+
+    EccBoundsFill(output, outputBufSz);
+
+    ret = EccBoundsBuild(useCert, ssh, output, outputSz, &idx, authData,
+            output + ECC_BOUNDS_SIGSTARTIDX, ECC_BOUNDS_SIGSTARTIDX, keySig);
+
+    /* Check for writes before startIdx regardless of outcome. */
+    if (EccBoundsScan(who, output, 0, startIdx, "before startIdx=", startIdx,
+            outputSz, ret) != 0) {
+        return -2;
+    }
+
+    if (expectSuccess) {
+        if (sizeSensitive && ret == WS_BUFFER_E) {
+            /* The buffer may have been sized for zero r/s padding, so
+             * padding could legitimately push the block over. Report it
+             * apart from a short block so the caller can retry. */
+            result = EccBoundsCheckRejected(who, output, startIdx,
+                    outputBufSz, idx, outputSz, ret, 0);
+            if (result != 0) {
+                return result;
+            }
+            return -12;
+        }
+        if (ret != WS_SUCCESS) {
+            printf("%s: outputSz=%u expected WS_SUCCESS, got %d\n", who,
+                    (unsigned)outputSz, ret);
+            return -1;
+        }
+        written = idx - startIdx;
+        result = verify(who, output, startIdx, written, outputSz, verifyCtx);
+        if (result != 0) {
+            return result;
+        }
+        if (EccBoundsScan(who, output, idx, outputBufSz, "past idx=", idx,
+                outputSz, ret) != 0) {
+            return -10;
+        }
+    }
+    else {
+        if (sizeSensitive && ret == WS_SUCCESS) {
+            /* Signature fit due to minimal mpint encoding, but it still
+             * must not have run past the buffer it was offered. */
+            if (EccBoundsScan(who, output, outputSz, outputBufSz,
+                    "past the offered buffer outputSz=", outputSz, outputSz,
+                    ret) != 0) {
+                return -5;
+            }
+            /* Caller retries. */
+            return -3;
+        }
+        /* A rejected build must leave everything at or past startIdx
+         * untouched. */
+        result = EccBoundsCheckRejected(who, output, startIdx, outputBufSz,
+                idx, outputSz, ret, 1);
+        if (result != 0) {
+            return result;
+        }
+    }
+
+    return 0;
+}
+
+typedef struct EccBoundsSigCtx {
+    WOLFSSH* ssh;
+    WS_KeySignature* keySig;
+    const char* names;
+    word32 namesSz;
+    word32 minWritten;
+    word32 maxWritten;
+} EccBoundsSigCtx;
+
+/* Success shape of the signed block: the framed algorithm name, then the
+ * r/s mpints. Returns 0, -3 to retry, -7, -8, or a code from
+ * EccBoundsCheckSig(). */
+static int EccBoundsVerifySigBlock(const char* who, const byte* output,
+        word32 startIdx, word32 written, word32 outputSz, void* ctx)
+{
+    EccBoundsSigCtx* sc = (EccBoundsSigCtx*)ctx;
+
+    if (written < sc->minWritten) {
+        /* Minimal mpint encoding stripped a leading zero, so the block
+         * came in short of the target. Let the caller retry with a fresh
+         * signature. */
+        return -3;
+    }
+    if (written > sc->maxWritten) {
+        printf("%s: outputSz=%u sig block size %u outside [%u, %u]\n", who,
+                (unsigned)outputSz, (unsigned)written,
+                (unsigned)sc->minWritten, (unsigned)sc->maxWritten);
+        return -7;
+    }
+    /* Verify sig block header derived from bounds check arithmetic. */
+    if (GetU32BE(output + startIdx) != written - LENGTH_SZ ||
+            GetU32BE(output + startIdx + LENGTH_SZ) != sc->namesSz ||
+            WMEMCMP(output + startIdx + (LENGTH_SZ * 2), sc->names,
+                    sc->namesSz) != 0 ||
+            GetU32BE(output + startIdx + (LENGTH_SZ * 2) + sc->namesSz) !=
+                    written - (LENGTH_SZ * 3) - sc->namesSz) {
+        printf("%s: outputSz=%u sig block header malformed\n", who,
+                (unsigned)outputSz);
+        return -8;
+    }
+
+    return EccBoundsCheckSig(who, sc->ssh, sc->keySig, output, startIdx,
+            written, sc->namesSz, outputSz);
+}
+
+/* Run one BuildUserAuthRequestEcc() bounds case. Returns 0 on match. */
+static int RunEccBoundsCase(WOLFSSH* ssh, WS_KeySignature* keySig,
+        const char* names, word32 namesSz, word32 startIdx,
+        word32 outputSz, word32 minWritten, word32 maxWritten,
+        int expectSuccess, int sizeSensitive, int useCert)
+{
+    static const char who[] = "RunEccBoundsCase";
+    WS_UserAuthData authData;
+    EccBoundsSigCtx sc;
+    /* Covers startIdx + reqMax plus slack for the overflow scan. */
+    byte   output[512];
+
+    WMEMSET(&authData, 0, sizeof(authData));
+    sc.ssh = ssh;
+    sc.keySig = keySig;
+    sc.names = names;
+    sc.namesSz = namesSz;
+    sc.minWritten = minWritten;
+    sc.maxWritten = maxWritten;
+
+    return RunEccBoundsShared(who, ssh, useCert, &authData, keySig, output,
+            (word32)sizeof(output), startIdx, outputSz, expectSuccess,
+            sizeSensitive, EccBoundsVerifySigBlock, &sc);
+}
+
+/* Curve bounds test. Retries bounds check with perturbed session ID. */
+static int RunEccBoundsCurve(WOLFSSH* ssh, byte algoId,
+        word32 keySz, const char* names, int useCert)
+{
+    WS_KeySignature keySig;
+    word32 namesSz = (word32)WSTRLEN(names);
+    word32 reqMin = namesSz + (LENGTH_SZ * 5) + (keySz * 2);
+    /* Padded or not, each mpint is at most keySz + 1 bytes. On P-521 it is
+     * at most keySz, since its top byte never has bit 7 set, so reqMax is
+     * reqMin there. */
+    word32 reqMax = reqMin + (keySz == 66 ? 0 : 2);
+    byte   savedSessionId0;
+    int    result = 0;
+    int    ret;
+    int    attempt;
+
+    WMEMSET(&keySig, 0, sizeof(keySig));
+    keySig.keyId = algoId;
+    keySig.sigId = algoId;
+    /* The retry loops perturb this byte to force a fresh signature. */
+    savedSessionId0 = ssh->sessionId[0];
+    ret = wc_ecc_init(&keySig.ks.ecc.key);
+    if (ret != 0) {
+        printf("RunEccBoundsCurve: wc_ecc_init failed: %d\n", ret);
+        return -1;
+    }
+    ret = wc_ecc_make_key(ssh->rng, (int)keySz, &keySig.ks.ecc.key);
+    if (ret != 0) {
+        printf("RunEccBoundsCurve: wc_ecc_make_key failed: %d\n", ret);
+        wc_ecc_free(&keySig.ks.ecc.key);
+        return -2;
+    }
+
+    /* startIdx past the end of the buffer: outputSz - begin underflows to
+     * ~4e9 without the guard, so only this case separates a present guard
+     * from a missing one. */
+    result = RunEccBoundsCase(ssh, &keySig, names, namesSz,
+            ECC_BOUNDS_STARTIDX, ECC_BOUNDS_STARTIDX - 1, 0, reqMax, 0, 0,
+            useCert);
+    if (result != 0) {
+        if (result == -9) {
+            printf("RunEccBoundsCurve: %s accepted a buffer ending before"
+                    " startIdx\n", names);
+        }
+        else if (result == -5) {
+            printf("RunEccBoundsCurve: %s wrote into the output buffer while"
+                    " rejecting\n", names);
+        }
+        result = -100 + result;
+        goto done;
+    }
+
+    /* Buffer ends exactly at startIdx: outRemaining is 0, so the length
+     * check alone rejects it. */
+    result = RunEccBoundsCase(ssh, &keySig, names, namesSz,
+            ECC_BOUNDS_STARTIDX, ECC_BOUNDS_STARTIDX, 0, reqMax, 0, 0,
+            useCert);
+    if (result != 0) {
+        if (result == -9) {
+            printf("RunEccBoundsCurve: %s accepted a buffer with no room"
+                    " left at startIdx\n", names);
+        }
+        else if (result == -5) {
+            printf("RunEccBoundsCurve: %s wrote into the output buffer while"
+                    " rejecting\n", names);
+        }
+        result = -200 + result;
+        goto done;
+    }
+
+    /* One byte under the largest block a signature can need: the only build
+     * that can reject it is one needing exactly reqMax, so a rejection here
+     * pins the check to outRemaining == required - 1. Anything smaller fits
+     * and asks for a retry. A check loose by a byte shows up as a partial
+     * write (-5), since the mpint encoder still rejects the short buffer. */
+    for (attempt = 0; attempt < ECC_BOUNDS_SIG_RETRIES; attempt++) {
+        ssh->sessionId[0] = (byte)(savedSessionId0 ^ attempt);
+        result = RunEccBoundsCase(ssh, &keySig, names, namesSz,
+                ECC_BOUNDS_STARTIDX, ECC_BOUNDS_STARTIDX + reqMax - 1,
+                0, reqMax, 0, 1, useCert);
+        if (result != -3) {
+            /* Stop retrying on proper rejection or a genuine error. */
+            break;
+        }
+        /* result == -3: the signature needed less than reqMax, so the buffer
+         * was not one byte short of it. Try again. */
+    }
+    ssh->sessionId[0] = savedSessionId0;
+    if (result != 0) {
+        if (result == -3) {
+            printf("RunEccBoundsCurve: %s never rejected a buffer one byte"
+                    " under the %u bytes its signature needed in %d"
+                    " attempts\n", names, (unsigned)reqMax,
+                    ECC_BOUNDS_SIG_RETRIES);
+        }
+        result = -300 + result;
+        goto done;
+    }
+
+    /* Block of exactly reqMin bytes: should accept. */
+    for (attempt = 0; attempt < ECC_BOUNDS_SIG_RETRIES; attempt++) {
+        ssh->sessionId[0] = (byte)(savedSessionId0 ^ attempt);
+        result = RunEccBoundsCase(ssh, &keySig, names, namesSz,
+                ECC_BOUNDS_STARTIDX, ECC_BOUNDS_STARTIDX + reqMin, reqMin,
+                reqMin, 1, 1, useCert);
+        if (result != -3 && result != -12) {
+            /* Stop retrying on proper acceptance or a genuine error. */
+            break;
+        }
+        /* result == -12: padding pushed the block past reqMin.
+         * result == -3: the block came in short of reqMin. Try again. */
+    }
+    ssh->sessionId[0] = savedSessionId0;
+    if (result != 0) {
+        if (result == -3 || result == -12) {
+            printf("RunEccBoundsCurve: %s never fit the exact-min buffer"
+                    " in %d attempts\n", names, ECC_BOUNDS_SIG_RETRIES);
+        }
+        result = -400 + result;
+        goto done;
+    }
+
+    /* Exactly max bounds (r and s both padded): should always accept. The
+     * block can never exceed reqMax, so a WS_BUFFER_E here is an over-strict
+     * bounds check. Retry until the block really is reqMax, so the case
+     * cannot pass on a shorter signature that left the buffer slack. When
+     * reqMax == reqMin the exact-min loop already made this assertion. */
+    for (attempt = 0; reqMax != reqMin && attempt < ECC_BOUNDS_SIG_RETRIES;
+            attempt++) {
+        ssh->sessionId[0] = (byte)(savedSessionId0 ^ attempt);
+        result = RunEccBoundsCase(ssh, &keySig, names, namesSz,
+                ECC_BOUNDS_STARTIDX, ECC_BOUNDS_STARTIDX + reqMax, reqMax,
+                reqMax, 1, 1, useCert);
+        if (result != -3) {
+            /* Stop retrying on proper acceptance or a genuine error. */
+            break;
+        }
+        /* result == -3: block came in under reqMax; try again. */
+    }
+    ssh->sessionId[0] = savedSessionId0;
+    if (result != 0) {
+        if (result == -12) {
+            printf("RunEccBoundsCurve: %s rejected a max-size buffer of"
+                    " %u bytes\n", names, (unsigned)reqMax);
+        }
+        else if (result == -3) {
+            printf("RunEccBoundsCurve: %s never produced a max-size block of"
+                    " %u bytes in %d attempts\n", names, (unsigned)reqMax,
+                    ECC_BOUNDS_SIG_RETRIES);
+        }
+        result = -500 + result;
+        goto done;
+    }
+
+done:
+    wc_ecc_free(&keySig.ks.ecc.key);
+    return result;
+}
+
+/* Any built ECDSA id works where the case never inspects the curve. */
+#ifndef WOLFSSH_NO_ECDSA_SHA2_NISTP256
+    #define ECC_BOUNDS_ANY_ALGOID ID_ECDSA_SHA2_NISTP256
+    #define ECC_BOUNDS_ANY_KEYSZ  32
+#elif !defined(WOLFSSH_NO_ECDSA_SHA2_NISTP384)
+    #define ECC_BOUNDS_ANY_ALGOID ID_ECDSA_SHA2_NISTP384
+    #define ECC_BOUNDS_ANY_KEYSZ  48
+#else
+    #define ECC_BOUNDS_ANY_ALGOID ID_ECDSA_SHA2_NISTP521
+    #define ECC_BOUNDS_ANY_KEYSZ  66
+#endif
+
+/* Ids outside the builder's ECDSA switch, so they reach its default arm.
+ * Which of them map to a hash this build compiled in varies, and HashForId()
+ * is WOLFSSH_LOCAL, so try them until one gets past the signing step. */
+static const byte eccBoundsBadAlgoIds[] = {
+    ID_ECDH_SHA2_NISTP256, ID_DH_GROUP14_SHA256, ID_DH_GEX_SHA256,
+#ifndef WOLFSSH_NO_CURVE25519_SHA256
+    ID_CURVE25519_SHA256,
+#endif
+    ID_RSA_SHA2_256, ID_ECDH_SHA2_NISTP384,
+    ID_ECDH_SHA2_NISTP521, ID_ED25519, ID_SSH_RSA, ID_DH_GROUP1_SHA1
+};
+
+/* The arguments of the builder's guard chain, in the order the NULL cases
+ * below null them out one at a time. */
+static const char* const eccBoundsNullArgNames[] = {
+    "ssh", "output", "idx", "authData", "sigStart", "keySig"
+};
+
+/* Cover the NULL-argument and invalid-algorithm guards of
+ * BuildUserAuthRequestEcc() and BuildUserAuthRequestEccCert(), which the size
+ * cases never reach. */
+static int RunEccBoundsGuards(WOLFSSH* ssh, int useCert)
+{
+    static const char who[] = "RunEccBoundsGuards";
+    WS_UserAuthData authData;
+    WS_KeySignature keySig;
+    byte   output[512];
+    word32 idx;
+    word32 i;
+    int    ret;
+    int    result = 0;
+
+    WMEMSET(&authData, 0, sizeof(authData));
+    WMEMSET(&keySig, 0, sizeof(keySig));
+    EccBoundsFill(output, (word32)sizeof(output));
+    keySig.keyId = ECC_BOUNDS_ANY_ALGOID;
+    keySig.sigId = ECC_BOUNDS_ANY_ALGOID;
+
+    /* Each argument is nulled on its own, so dropping one term of the guard
+     * chain cannot hide behind another NULL. Nothing may be written. */
+    for (i = 0; i < (word32)(sizeof(eccBoundsNullArgNames) /
+            sizeof(eccBoundsNullArgNames[0])); i++) {
+        idx = ECC_BOUNDS_STARTIDX;
+        ret = EccBoundsBuild(useCert,
+                i == 0 ? NULL : ssh,
+                i == 1 ? NULL : output, (word32)sizeof(output),
+                i == 2 ? NULL : &idx,
+                i == 3 ? NULL : &authData,
+                i == 4 ? NULL : output, 0,
+                i == 5 ? NULL : &keySig);
+        if (ret != WS_BAD_ARGUMENT) {
+            printf("%s: NULL %s expected WS_BAD_ARGUMENT, got %d\n",
+                    who, eccBoundsNullArgNames[i], ret);
+            return -20 - (int)i;
+        }
+        if (EccBoundsScan(who, output, 0, (word32)sizeof(output),
+                "with a NULL argument, index=", i, (word32)sizeof(output),
+                ret) != 0) {
+            return -30 - (int)i;
+        }
+    }
+
+    ret = wc_ecc_init(&keySig.ks.ecc.key);
+    if (ret != 0) {
+        printf("%s: wc_ecc_init failed: %d\n", who, ret);
+        return -26;
+    }
+    ret = wc_ecc_make_key(ssh->rng, ECC_BOUNDS_ANY_KEYSZ, &keySig.ks.ecc.key);
+    if (ret != 0) {
+        printf("%s: wc_ecc_make_key failed: %d\n", who, ret);
+        wc_ecc_free(&keySig.ks.ecc.key);
+        return -27;
+    }
+
+    /* A sigId the switch does not name leaves names unset, so the builder
+     * must bail out with WS_INVALID_ALGO_ID before reading it. The buffer is
+     * ample, so only the algorithm check can reject this. */
+    for (i = 0; i < (word32)(sizeof(eccBoundsBadAlgoIds) /
+            sizeof(eccBoundsBadAlgoIds[0])); i++) {
+        keySig.sigId = eccBoundsBadAlgoIds[i];
+        idx = ECC_BOUNDS_STARTIDX;
+        /* Refill, since a rejected attempt may still have written. */
+        EccBoundsFill(output, (word32)sizeof(output));
+        ret = EccBoundsBuild(useCert, ssh, output, (word32)sizeof(output),
+                &idx, &authData, output, 0, &keySig);
+        if (ret == WS_INVALID_ALGO_ID) {
+            break;
+        }
+        if (ret == WS_SUCCESS) {
+            printf("%s: sigId %d was signed instead of rejected\n",
+                    who, eccBoundsBadAlgoIds[i]);
+            wc_ecc_free(&keySig.ks.ecc.key);
+            return -28;
+        }
+        /* Only a hash or signing failure may move on: the plain builder
+         * passes wolfCrypt's code through, the cert builder maps it to
+         * WS_ECC_E. Any other wolfSSH code is a wrong rejection. */
+        if (ret != WS_ECC_E && ret <= WS_ERROR) {
+            printf("%s: sigId %d rejected with %d instead of"
+                    " WS_INVALID_ALGO_ID\n", who, eccBoundsBadAlgoIds[i], ret);
+            wc_ecc_free(&keySig.ks.ecc.key);
+            return -36;
+        }
+    }
+    if (ret != WS_INVALID_ALGO_ID) {
+        /* No candidate id maps to a hash this build compiled in, so the
+         * sub-case cannot run. Skip it rather than fail the suite. */
+        printf("%s: SKIP, no unnamed sigId reached the algorithm check, last"
+                " ret=%d\n", who, ret);
+        result = 1;
+    }
+    else if (EccBoundsScan(who, output, 0, ECC_BOUNDS_STARTIDX,
+            "before startIdx=", ECC_BOUNDS_STARTIDX,
+            (word32)sizeof(output), ret) != 0) {
+        result = -29;
+    }
+    else {
+        result = EccBoundsCheckRejected(who, output, ECC_BOUNDS_STARTIDX,
+                (word32)sizeof(output), idx, (word32)sizeof(output), ret, 0);
+    }
+
+    wc_ecc_free(&keySig.ks.ecc.key);
+    return result;
+}
+
+#ifdef WOLFSSH_AGENT
+
+/* The stub agent always returns a signature of this size. */
+#define ECC_BOUNDS_AGENT_SIG_SZ 64
+#define ECC_BOUNDS_AGENT_SIG_BYTE 0x5C
+
+/* The agent arm never touches the key, so any built ECDSA id works. */
+#define ECC_BOUNDS_AGENT_ALGOID ECC_BOUNDS_ANY_ALGOID
+
+typedef struct EccBoundsAgentCtx {
+    byte   response[(LENGTH_SZ * 2) + 1 + ECC_BOUNDS_AGENT_SIG_SZ];
+    word32 responseSz;
+} EccBoundsAgentCtx;
+
+static int EccBoundsAgentCb(WS_AgentCbAction action, void* ctx)
+{
+    (void)ctx;
+
+    if (action == WOLFSSH_AGENT_LOCAL_SETUP ||
+            action == WOLFSSH_AGENT_LOCAL_CLEANUP) {
+        return WS_AGENT_SUCCESS;
+    }
+
+    return WS_AGENT_INVALID_ACTION;
+}
+
+/* Swallows the sign request and replays a canned SIGN_RESPONSE. */
+static int EccBoundsAgentIoCb(WS_AgentIoCbAction action, void* buf,
+        word32 bufSz, void* ctx)
+{
+    EccBoundsAgentCtx* io = (EccBoundsAgentCtx*)ctx;
+
+    if (action == WOLFSSH_AGENT_IO_WRITE) {
+        return (int)bufSz;
+    }
+    if (action != WOLFSSH_AGENT_IO_READ || io == NULL) {
+        return 0;
+    }
+    if (bufSz < io->responseSz) {
+        return 0;
+    }
+    WMEMCPY(buf, io->response, io->responseSz);
+
+    return (int)io->responseSz;
+}
+
+static void EccBoundsAgentResponse(EccBoundsAgentCtx* io)
+{
+    word32 idx = 0;
+
+    WMEMSET(io, 0, sizeof(*io));
+    PutU32BE(io->response + idx, 1 + LENGTH_SZ + ECC_BOUNDS_AGENT_SIG_SZ);
+    idx += LENGTH_SZ;
+    io->response[idx++] = MSGID_AGENT_SIGN_RESPONSE;
+    PutU32BE(io->response + idx, ECC_BOUNDS_AGENT_SIG_SZ);
+    idx += LENGTH_SZ;
+    WMEMSET(io->response + idx, ECC_BOUNDS_AGENT_SIG_BYTE,
+            ECC_BOUNDS_AGENT_SIG_SZ);
+    idx += ECC_BOUNDS_AGENT_SIG_SZ;
+    io->responseSz = idx;
+}
+
+/* Success shape of the agent arm: the fixed-size canned signature, framed as
+ * a string. Returns 0, -7, -8 or -11. */
+static int EccBoundsVerifyAgentSig(const char* who, const byte* output,
+        word32 startIdx, word32 written, word32 outputSz, void* ctx)
+{
+    word32 i;
+
+    (void)ctx;
+
+    if (written != LENGTH_SZ + ECC_BOUNDS_AGENT_SIG_SZ) {
+        printf("%s: outputSz=%u wrote %u bytes, expected %u\n", who,
+                (unsigned)outputSz, (unsigned)written,
+                (unsigned)(LENGTH_SZ + ECC_BOUNDS_AGENT_SIG_SZ));
+        return -7;
+    }
+    if (GetU32BE(output + startIdx) != ECC_BOUNDS_AGENT_SIG_SZ) {
+        printf("%s: outputSz=%u sig length malformed\n", who,
+                (unsigned)outputSz);
+        return -8;
+    }
+    for (i = startIdx + LENGTH_SZ; i < startIdx + written; i++) {
+        if (output[i] != ECC_BOUNDS_AGENT_SIG_BYTE) {
+            printf("%s: outputSz=%u agent signature not copied at byte %u\n",
+                    who, (unsigned)outputSz, (unsigned)i);
+            return -11;
+        }
+    }
+
+    return 0;
+}
+
+/* Run one agent-signing bounds case. The agent returns a fixed-size
+ * signature, so this case is not size sensitive. Returns 0 on match. */
+static int RunEccBoundsAgentCase(WOLFSSH* ssh, byte algoId, word32 startIdx,
+        word32 outputSz, int expectSuccess)
+{
+    static const char who[] = "RunEccBoundsAgentCase";
+    WS_UserAuthData authData;
+    WS_KeySignature keySig;
+    byte   pubKey[32];
+    byte   output[256];
+
+    WMEMSET(&authData, 0, sizeof(authData));
+    WMEMSET(&keySig, 0, sizeof(keySig));
+    WMEMSET(pubKey, 0x3C, sizeof(pubKey));
+    keySig.keyId = algoId;
+    keySig.sigId = algoId;
+    authData.sf.publicKey.publicKey = pubKey;
+    authData.sf.publicKey.publicKeySz = (word32)sizeof(pubKey);
+
+    return RunEccBoundsShared(who, ssh, 0, &authData, &keySig, output,
+            (word32)sizeof(output), startIdx, outputSz, expectSuccess, 0,
+            EccBoundsVerifyAgentSig, NULL);
+}
+
+/* Cover the agent-signing bounds arm of BuildUserAuthRequestEcc(). */
+static int RunEccBoundsAgent(byte algoId)
+{
+    WOLFSSH_CTX* ctx = NULL;
+    WOLFSSH*     ssh = NULL;
+    EccBoundsAgentCtx io;
+    word32 reqd = LENGTH_SZ + ECC_BOUNDS_AGENT_SIG_SZ;
+    int    result = 0;
+
+    EccBoundsAgentResponse(&io);
+
+    ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, NULL);
+    if (ctx == NULL) {
+        printf("RunEccBoundsAgent: CTX_new failed\n");
+        return -1;
+    }
+    if (wolfSSH_CTX_AGENT_enable(ctx, 1) != WS_SUCCESS ||
+            wolfSSH_CTX_set_agent_cb(ctx, EccBoundsAgentCb,
+                    EccBoundsAgentIoCb) != WS_SUCCESS) {
+        printf("RunEccBoundsAgent: agent ctx setup failed\n");
+        wolfSSH_CTX_free(ctx);
+        return -2;
+    }
+    ssh = wolfSSH_new(ctx);
+    if (ssh == NULL) {
+        printf("RunEccBoundsAgent: wolfSSH_new failed\n");
+        wolfSSH_CTX_free(ctx);
+        return -3;
+    }
+    /* wolfSSH_new() never allocates ssh->agent (wolfSSH_connect() does), so
+     * create one here for wolfSSH_AGENT_SignRequest(); wolfSSH_free() frees
+     * it. */
+    if (ssh->agent == NULL) {
+        ssh->agent = wolfSSH_AGENT_new(ctx->heap);
+    }
+    if (ssh->agent == NULL ||
+            wolfSSH_set_agent_cb_ctx(ssh, &io) != WS_SUCCESS ||
+            wolfSSH_AGENT_enable(ssh, 1) != WS_SUCCESS) {
+        printf("RunEccBoundsAgent: agent ssh setup failed\n");
+        wolfSSH_free(ssh);
+        wolfSSH_CTX_free(ctx);
+        return -4;
+    }
+
+    ssh->sessionIdSz = 16;
+    WMEMSET(ssh->sessionId, 0xA5, ssh->sessionIdSz);
+
+    /* startIdx past the end of the buffer: only this case distinguishes the
+     * outputSz <= begin guard from its absence, since outputSz - begin would
+     * otherwise underflow. */
+    result = RunEccBoundsAgentCase(ssh, algoId, ECC_BOUNDS_STARTIDX,
+            ECC_BOUNDS_STARTIDX - 1, 0);
+    if (result != 0) {
+        result = -100 + result;
+    }
+    /* Buffer ends exactly at startIdx: the length check alone rejects it. */
+    if (result == 0) {
+        result = RunEccBoundsAgentCase(ssh, algoId, ECC_BOUNDS_STARTIDX,
+                ECC_BOUNDS_STARTIDX, 0);
+        if (result != 0) {
+            result = -200 + result;
+        }
+    }
+    /* One byte short of the sig string: should reject. */
+    if (result == 0) {
+        result = RunEccBoundsAgentCase(ssh, algoId, ECC_BOUNDS_STARTIDX,
+                ECC_BOUNDS_STARTIDX + reqd - 1, 0);
+        if (result != 0) {
+            result = -300 + result;
+        }
+    }
+    /* Exactly the sig string: should accept. */
+    if (result == 0) {
+        result = RunEccBoundsAgentCase(ssh, algoId, ECC_BOUNDS_STARTIDX,
+                ECC_BOUNDS_STARTIDX + reqd, 1);
+        if (result != 0) {
+            result = -500 + result;
+        }
+    }
+
+    wolfSSH_free(ssh);
+    wolfSSH_CTX_free(ctx);
+    return result;
+}
+#endif /* WOLFSSH_AGENT */
+
+static int test_BuildUserAuthRequestEccBounds(void)
+{
+    WOLFSSH_CTX* ctx = NULL;
+    WOLFSSH*     ssh = NULL;
+    int   result = 0;
+    int   skipped = 0;
+
+    ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, NULL);
+    if (ctx == NULL) {
+        printf("test_BuildUserAuthRequestEccBounds: CTX_new failed\n");
+        return -1;
+    }
+    ssh = wolfSSH_new(ctx);
+    if (ssh == NULL) {
+        printf("test_BuildUserAuthRequestEccBounds: wolfSSH_new failed\n");
+        wolfSSH_CTX_free(ctx);
+        return -2;
+    }
+
+    ssh->sessionIdSz = 16;
+    WMEMSET(ssh->sessionId, 0xA5, ssh->sessionIdSz);
+
+    /* Distinct non-overlapping offsets map a failure result to a single curve
+     * and specific test case. RunEccBoundsCurve handles offset composition. */
+#ifndef WOLFSSH_NO_ECDSA_SHA2_NISTP256
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_ECDSA_SHA2_NISTP256,
+                32, "ecdsa-sha2-nistp256", 0);
+        if (result != 0) {
+            result = -1000 + result;
+        }
+    }
+#ifdef WOLFSSH_CERTS
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_X509V3_ECDSA_SHA2_NISTP256,
+                32, "x509v3-ecdsa-sha2-nistp256", 1);
+        if (result != 0) {
+            result = -2000 + result;
+        }
+    }
+#endif /* WOLFSSH_CERTS */
+#endif
+#ifndef WOLFSSH_NO_ECDSA_SHA2_NISTP384
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_ECDSA_SHA2_NISTP384,
+                48, "ecdsa-sha2-nistp384", 0);
+        if (result != 0) {
+            result = -3000 + result;
+        }
+    }
+#ifdef WOLFSSH_CERTS
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_X509V3_ECDSA_SHA2_NISTP384,
+                48, "x509v3-ecdsa-sha2-nistp384", 1);
+        if (result != 0) {
+            result = -4000 + result;
+        }
+    }
+#endif /* WOLFSSH_CERTS */
+#endif
+#ifndef WOLFSSH_NO_ECDSA_SHA2_NISTP521
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_ECDSA_SHA2_NISTP521,
+                66, "ecdsa-sha2-nistp521", 0);
+        if (result != 0) {
+            result = -5000 + result;
+        }
+    }
+#ifdef WOLFSSH_CERTS
+    if (result == 0) {
+        result = RunEccBoundsCurve(ssh, ID_X509V3_ECDSA_SHA2_NISTP521,
+                66, "x509v3-ecdsa-sha2-nistp521", 1);
+        if (result != 0) {
+            result = -6000 + result;
+        }
+    }
+#endif /* WOLFSSH_CERTS */
+#endif
+
+    /* Guards the size cases never reach. Agent signing is disabled on this
+     * WOLFSSH, so this runs the plain ECDSA path. */
+    if (result == 0) {
+        result = RunEccBoundsGuards(ssh, 0);
+        if (result > 0) {
+            skipped = 1;
+            result = 0;
+        }
+        else if (result != 0) {
+            result = -8000 + result;
+        }
+    }
+#ifdef WOLFSSH_CERTS
+    /* The cert builder carries its own copy of both guards. */
+    if (result == 0) {
+        result = RunEccBoundsGuards(ssh, 1);
+        if (result > 0) {
+            skipped = 1;
+            result = 0;
+        }
+        else if (result != 0) {
+            result = -9000 + result;
+        }
+    }
+#endif /* WOLFSSH_CERTS */
+
+#ifdef WOLFSSH_AGENT
+    /* Run the agent arm on its own WOLFSSH. */
+    if (result == 0) {
+        result = RunEccBoundsAgent(ECC_BOUNDS_AGENT_ALGOID);
+        if (result != 0) {
+            result = -7000 + result;
+        }
+    }
+#endif /* WOLFSSH_AGENT */
+
+    wolfSSH_free(ssh);
+    wolfSSH_CTX_free(ctx);
+    /* 1 means every case that ran passed, but a sub-case was skipped. */
+    return (result == 0 && skipped) ? 1 : result;
+}
+#endif /* !WOLFSSH_NO_ECDSA */
+
 #if !defined(WOLFSSH_NO_ECDSA) && defined(HAVE_ECC_KEY_EXPORT)
 /* Private-only SEC1 DER (public point omitted): must succeed as cert may supply
  * public key later. Shared across P-256/P-384/P-521.
@@ -23378,6 +24392,16 @@ int wolfSSH_UnitTest(int argc, char** argv)
             unitResult > 0 ? "SKIPPED" : "FAILED"));
     testResult = testResult || (unitResult < 0);
 #endif
+#endif
+#ifndef WOLFSSH_NO_ECDSA
+    unitResult = test_BuildUserAuthRequestEccBounds();
+    /* 1 means every case that ran passed, but a sub-case was skipped for
+     * lack of a hash in this build */
+    printf("BuildUserAuthRequestEccBounds: %s (result=%d)\n",
+            (unitResult == 0 ? "SUCCESS" :
+             unitResult > 0 ? "SUCCESS (sub-case skipped)" : "FAILED"),
+            unitResult);
+    testResult = testResult || (unitResult < 0);
 #endif
 #if !defined(WOLFSSH_NO_ED25519) && defined(HAVE_ED25519) && \
     defined(HAVE_ED25519_SIGN) && defined(HAVE_ED25519_VERIFY) && \

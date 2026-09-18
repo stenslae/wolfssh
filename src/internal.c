@@ -26098,6 +26098,19 @@ int wolfSSH_TestParseECCPubKey(WOLFSSH* ssh, byte* pubKey, word32 pubKeySz)
     return ret;
 }
 
+/* Test hook for BuildUserAuthRequestEcc(). The caller sets
+ * ssh->sessionId/sessionIdSz, keySig->sigId and an initialized
+ * keySig->ks.ecc.key that it still owns. *idx advances only on
+ * WS_SUCCESS. */
+int wolfSSH_TestBuildUserAuthRequestEcc(WOLFSSH* ssh,
+        byte* output, word32 outputSz, word32* idx,
+        const WS_UserAuthData* authData,
+        const byte* sigStart, word32 sigStartIdx, WS_KeySignature* keySig)
+{
+    return BuildUserAuthRequestEcc(ssh, output, outputSz, idx, authData,
+            sigStart, sigStartIdx, keySig);
+}
+
 #ifdef WOLFSSH_CERTS
 /* Test hook for the certificate host key parser and its curve binding. The
  * caller sets ssh->handshake->pubKeyId to the negotiated algorithm; pubKey
@@ -26114,6 +26127,19 @@ int wolfSSH_TestParseECCPubKeyCert(WOLFSSH* ssh, byte* pubKey, word32 pubKeySz)
     FreePubKey(&sigKeyBlock);
 
     return ret;
+}
+
+/* Test hook for the X.509 certificate variant of the ECDSA user-auth
+ * signature builder. Same preconditions as
+ * wolfSSH_TestBuildUserAuthRequestEcc(), with keySig->sigId set to an
+ * x509v3-ecdsa-sha2-* algorithm. */
+int wolfSSH_TestBuildUserAuthRequestEccCert(WOLFSSH* ssh,
+        byte* output, word32 outputSz, word32* idx,
+        const WS_UserAuthData* authData,
+        const byte* sigStart, word32 sigStartIdx, WS_KeySignature* keySig)
+{
+    return BuildUserAuthRequestEccCert(ssh, output, outputSz, idx, authData,
+            sigStart, sigStartIdx, keySig);
 }
 #endif /* WOLFSSH_CERTS */
 
